@@ -151,7 +151,25 @@ included), or — killed hard — when the daemon there sees its process gone
 (connected to it or not), lends its card
 to a modem there, or is configured as a sponsor there is not lent. This
 needs **wwand-rsim-provider** on that router (the proxy; it pulls in
-wwand-rsim) — without it, `wwandctl rsim scan` from here says so and lists
+wwand-rsim).
+
+**A card the lending modem does not run on** — the one in its other slot,
+or an eSIM profile that is not enabled — is lent only with `option
+rsim_lend_switch '1'` on that modem's `wwand_modem` (off by default; LuCI:
+*Switch to the card for a lend*). Asked for it by ICCID
+(`wwand:iccid:<ICCID>`), the modem switches to it one step at a time — the
+slot, then the profile, as an ICCID-bound interface does — and the lend
+opens once it runs on it (at most 150 s); once no lend of it runs any more,
+or none was opened within 120 s, it goes back to the card it ran on, the
+same way. While it lends that card it has **no connection of its own**: on
+a router whose only link is that modem (an internet fallback), a lend cuts
+it off. A card an eIM plugin manages, or one an ICCID-bound interface is
+using, is not switched away from (the lend is refused with the reason).
+The scan lists such cards as lendable "after a switch". Without the option,
+the refusal names it. Not done at the daemon's exit: a modem that is
+switched to a lent card when wwand stops stays on it until its next
+bring-up (`option sim_slot`, a bound interface). Without wwand-rsim-provider
+on that router, `wwandctl rsim scan` from here says so and lists
 none of its modems' cards, only their AT ports; a router with only
 rsim-card has no modems to lend. As a named reader: `option type
 'wwand'`, `option host`, `option device '<modem>|iccid:<ICCID>'`, and the
@@ -419,6 +437,15 @@ Foxconn/Fibocom `AT^EFS`):
 | | Galaxy A5 (2016) over Bluetooth SAP, via a PC | card only (inactive SIM) |
 | Quectel RM520N-GL (MBIM, GL-X3000) | Smartmouse USB on a PC over SSH, through the QMI-over-MBIM passthrough | card only (a test card without service there; 431 commands, identity read) |
 | | the Chateau's Huawei E392 over SSH, APDU over QMI UIM | works (registered, connected with the card's own APN; no data with that SIM's plan) |
+| Quectel RG502Q-EA (QMI, NR7101) | the Chateau's RG650E over SSH (its eUICC, and a plain UICC), SIM Access and APDU | works **only while it runs on physical slot 1** (2026-11-21): on slot 2 it powers the remote card down 7 s after its first SELECT, for ever. The plugin now switches it to the remote card's slot for the session and back after (host-tested; on the hardware so far with `sim_slot '1'` set by hand) |
+
+**The client's physical slot.** A session first puts the modem on the
+physical slot its remote card is offered on (`rsim_slot`, default 1) and
+answers the core's `sim_slot` hook while the card is in use, so a modem reset
+does not switch it back to `option sim_slot`; once no remote card is wanted,
+or a failed one waits for its retry with `rsim_fallback local`, it goes back
+to the slot it ran on. A modem with one slot, or one whose slot list cannot
+be read, is left as it is.
 
 An MBIM modem is a client through its QMI-over-MBIM passthrough (wwand's
 `qmi_client` there): on the RM520N the UIM Remote indications come over it,
