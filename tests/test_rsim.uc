@@ -1104,10 +1104,146 @@ let donor_plugin = (o) => { let targets = {}; return rsim.create({
 	qmi_release: () => null,
 	modem_radio: (ref, on, cb) => { push(o.radio ?? [], [ ref, on ]); if (o.mods?.[ref]) o.mods[ref].lowpower_parked = !on; cb?.(null); },
 	sim_slots: o.sim_slots,
+	sim_bring: o.sim_bring,
 	modem_sections: o.modem_sections ?? (() => ({})),
 	pid_alive: o.pid_alive,
 	now: () => o.t.now,
 }); };
+
+// --- the CLIENT's physical slot: the RG502Q-EA uses UIM Remote slot 1 only
+// while it runs on physical slot 1 (NR7101, 2026-11-21: on slot 2 one SELECT
+// MF, then a power-down every 7 s). The session puts it there first, answers
+// sim_slot for the bring-ups meanwhile, and puts it back once no remote card
+// is wanted.
+{
+	let t = { now: 1000 };
+	let target = fake_client(), donor = apdu_donor();
+	let m0_active = 2, switches = [];
+	let slots_of = (ref) => (ref == 'm0')
+		? [ { physical: 1, active: m0_active == 1, logical_slot: 1, card: 'absent' },
+		    { physical: 2, active: m0_active == 2, logical_slot: 1, card: 'present', iccid: '89490200001022832490' } ]
+		: slots_242;
+	let p = donor_plugin({ t: t, target: target, donor: donor,
+		sim_slots: (ref, cb) => cb(null, { slots: slots_of(ref) }) });
+	// sim_switch_slot is a dep the fake does not give by default
+	p = null;
+	let targets = {};
+	p = rsim.create({
+		log: (l, m) => null, sim_changed: () => null,
+		modem_of: (ref) => ({ modem: (ref == 'm0') ? (targets[ref] ??= { state: 'READY', lowpower_parked: true }) : modem_obj(ref) }),
+		qmi_client: (ref, schema, cb) => cb(null, (ref == 'm1') ? donor : target),
+		qmi_release: () => null,
+		modem_radio: (ref, on, cb) => cb?.(null),
+		sim_slots: (ref, cb) => cb(null, { slots: slots_of(ref) }),
+		sim_switch_slot: (ref, phys, cb) => { push(switches, [ ref, phys ]); if (ref == 'm0') m0_active = phys; cb(null, {}); },
+		modem_sections: () => ({}),
+		now: () => t.now,
+	});
+	let ext = { rsim_reader: 'modem:m1', rsim_donor_mode: 'apdu', rsim_donor_slot: '2', rsim_fallback: 'local' };
+
+	p.tick('m0', ext);
+	run_for(50);
+	eq(switches, [ [ 'm0', 1 ] ], 'client slot: the modem is switched to the remote card\'s physical slot first');
+	eq(target.events(), [], 'client slot: ...and that attempt ends there, nothing offered yet');
+
+	t.now += 30;
+	p.tick('m0', ext);
+	run_for(50);
+	ok(length(target.events()) > 0, 'client slot: on the right slot the remote card is offered');
+	eq(p.sim_slot('m0', ext)?.slot, 1, 'client slot: sim_slot answers the remote card\'s slot for the bring-ups');
+	eq(length(switches), 1, 'client slot: no second switch while it is right');
+
+	// the modem restarted: the session ends and the next starts a tick later —
+	// the bring-up in between must still hear the remote card's slot
+	target.destroyed = true;
+	p.tick('m0', ext);
+	run_for(50);
+	eq(p.sim_slot('m0', ext)?.slot, 1, 'client slot: between two sessions (a modem restart) still the remote card\'s slot');
+	target.destroyed = false;
+
+	// the remote card switched off: back to the modem's own card's slot
+	let off = { rsim_fallback: 'local' };
+	p.tick('m0', off);
+	run_for(50);
+	t.now += 30;
+	p.tick('m0', off);
+	run_for(50);
+	eq(switches[length(switches) - 1], [ 'm0', 2 ], 'client slot: back to physical slot 2 once no remote card is wanted');
+	eq(p.sim_slot('m0', off), null, 'client slot: ...and sim_slot answers nothing any more');
+}
+
+// the switch back, made robust (Codex review): retried when refused, the
+// first slot kept over a second move, rebuilt from option sim_slot after a
+// daemon restart, and done at the daemon's exit with rsim_fallback local
+let slot_client = (o) => {
+	let st = { active: o.active ?? 2, switches: [], fail_back: o.fail_back ?? 0, t: { now: 1000 } };
+	let target = fake_client(), donor = apdu_donor();
+	let targets = {};
+	st.target = target;
+	st.p = rsim.create({
+		log: (l, m) => null, sim_changed: () => null,
+		modem_of: (ref) => ({ modem: (ref == 'm0')
+			? (targets[ref] ??= { state: 'READY', lowpower_parked: true, config: { sim_slot: o.sim_slot ?? 2 } })
+			: modem_obj(ref) }),
+		qmi_client: (ref, schema, cb) => cb(null, (ref == 'm1') ? donor : target),
+		qmi_release: () => null,
+		modem_radio: (ref, on, cb) => cb?.(null),
+		sim_slots: (ref, cb) => cb(null, { slots: (ref == 'm0')
+			? [ { physical: 1, active: st.active == 1, logical_slot: 1, card: 'absent' },
+			    { physical: 2, active: st.active == 2, logical_slot: 1, card: 'present', iccid: '89490200001022832490' } ]
+			: slots_242 }),
+		sim_switch_slot: (ref, phys, cb) => {
+			push(st.switches, phys);
+			if (phys != 1 && st.fail_back > 0) { st.fail_back--; return cb({ error: 'busy' }); }
+			if (ref == 'm0') st.active = phys;
+			cb(null, {});
+		},
+		modem_sections: () => ({}),
+		now: () => st.t.now,
+	});
+	st.tick = (ext) => { st.p.tick('m0', ext); run_for(50); st.t.now += 30; };
+	return st;
+};
+let on_ext = { rsim_reader: 'modem:m1', rsim_donor_mode: 'apdu', rsim_donor_slot: '2', rsim_fallback: 'local' };
+let off_ext = { rsim_fallback: 'local' };
+{
+	let c = slot_client({ fail_back: 1 });
+	c.tick(on_ext); c.tick(on_ext);
+	c.tick(off_ext); c.tick(off_ext);
+	eq(c.switches, [ 1, 2 ], 'switch back: tried once the remote card is off');
+	eq(c.active, 1, 'switch back: ...refused by the modem');
+	c.tick(off_ext);
+	eq([ c.switches, c.active ], [ [ 1, 2, 2 ], 2 ], 'switch back: tried again on the next tick, and done');
+}
+{
+	// rsim_slot changed to 2 after a 2 -> 1 move, and that second move is
+	// refused: the first record stays, so switching off still finds slot 2
+	let c = slot_client({ fail_back: 1 });
+	c.tick(on_ext); c.tick(on_ext);
+	let on2 = { ...on_ext, rsim_slot: '2' };
+	c.tick(on2); c.tick(on2); c.tick(on2);
+	eq(c.switches[1], 2, 'second move: tried');
+	c.tick(off_ext); c.tick(off_ext); c.tick(off_ext);
+	eq(c.active, 2, 'second move refused: switching off still goes back to the first slot');
+}
+{
+	// a daemon that restarted after moving it: the modem is on slot 1 already
+	let c = slot_client({ active: 1, sim_slot: 2 });
+	c.tick(on_ext); c.tick(on_ext);
+	eq(c.switches, [], 'restart: already on the remote card\'s slot, nothing switched');
+	c.tick(off_ext); c.tick(off_ext);
+	eq(c.active, 2, 'restart: switching it off goes back to option sim_slot');
+}
+{
+	// the daemon stops with rsim_fallback local: the modem gets its own slot back
+	let c = slot_client({});
+	c.tick(on_ext); c.tick(on_ext);
+	eq(c.active, 1, 'exit: on the remote card\'s slot');
+	ok(c.p.stop(), 'exit: stop has work on its way');
+	for (let i = 0; i < 5 && c.p.busy(); i++)
+		run_for(50);
+	eq([ c.active, c.p.busy() ], [ 2, false ], 'exit: back on slot 2 before the daemon is let go');
+}
 
 {
 	let t = { now: 1000 };
@@ -1838,6 +1974,132 @@ let donor_plugin = (o) => { let targets = {}; return rsim.create({
 	eq(length(ups), 1, 'lender settings: none sent, nothing written');
 	p.stop();
 	run_for(50);
+}
+
+// --- a lend of a card the modem does not run on (rsim_lend_switch) -------------
+// Another slot or an eSIM profile: lend_prepare takes the modem there one
+// step at a time (wwand's sim_bring), only with the option set; once no lend
+// of it runs any more, the tick takes it back to the card it ran on.
+{
+	let t = { now: 1000 };
+	let A = '89490200001022832490', B = '89882390001598474352';
+	let brings = [];
+	let mo = modem_obj('m1');
+	mo.info = { iccid: A };
+	// B is in slot 2 as an eSIM profile: a slot switch, the card read, the
+	// profile enabled, then the modem runs it; and back: the slot switch only
+	let bring = (ref, iccid, cb) => {
+		push(brings, iccid);
+		let n = length(filter(brings, (x) => x == iccid));
+		if (iccid == B)
+			return (n == 1) ? cb(null, { action: 'slot', slot: 2 })
+				: (n == 2) ? cb(null, { action: 'enable', slot: 2 })
+				: ((mo.info.iccid = B), cb(null, { action: 'ok' }));
+		if (n == 1)
+			return cb(null, { action: 'slot', slot: 1 });
+		mo.info.iccid = A;
+		cb(null, { action: 'ok' });
+	};
+	let p = donor_plugin({ t: t, target: fake_client(), donor: sap_donor([]), sim_bring: bring });
+	let op = (name, ref, ext, args) => {
+		let res = null;
+		p.ops[name](ref, ext, args, (e, r) => { res = e ? { err: e } : r; });
+		run_for(200);
+		return res;
+	};
+	let on = { rsim_lend_switch: '1' };
+
+	eq(op('lend_prepare', 'm1', {}, { iccid: B })?.err?.error, 'not_allowed',
+		'lend switch: refused without option rsim_lend_switch');
+	eq(brings, [], 'lend switch: ...and nothing switched');
+
+	eq(op('lend_prepare', 'm1', on, { iccid: B + 'F' }), { ready: false, step: 'switching to SIM slot 2' },
+		'lend switch: the first step, the slot');
+	eq(op('lend_prepare', 'm1', on, { iccid: B }), { ready: false, step: 'enabling eSIM profile ' + B },
+		'lend switch: the next step, the profile');
+	eq(op('lend_prepare', 'm1', on, { iccid: B }), { ready: true }, 'lend switch: then the modem runs it');
+	eq(op('lend_prepare', 'm1', on, { iccid: B }), { ready: true }, 'lend switch: asked again, nothing more to do');
+	eq(length(brings), 3, 'lend switch: three steps, no more');
+
+	eq(op('lend_open', 'm1', on, { mode: 'sap', client: '10.0.0.8', pid: 4799 })?.err?.error, 'busy',
+		'lend switch: a lend that does not name the switched card is refused');
+	let o = op('lend_open', 'm1', on, { mode: 'sap', client: '10.0.0.9', pid: 4800, iccid: B });
+	ok(o?.id, 'lend switch: the lend of the card it was switched for opens');
+	p.tick('m1', on); run_for(50);
+	eq(length(brings), 3, 'lend switch: no way back while it is lent');
+
+	eq(op('lend_close', 'm1', on, { id: o.id }), { closed: true }, 'lend switch: the lend ends');
+	for (let i = 0; i < 4; i++) { t.now += 10; p.tick('m1', on); run_for(200); }
+	eq(slice(brings, 3), [ A, A ], 'lend switch: back to the card it ran on, step by step');
+	eq(mo.info.iccid, A, 'lend switch: ...and it runs on it again');
+
+	// a switch the proxy never used goes back too
+	brings = [];
+	let mo2 = modem_obj('m2');
+	mo2.info = { iccid: A };
+	let used = 0;
+	let p2 = donor_plugin({ t: t, target: fake_client(), donor: sap_donor([]),
+		sim_bring: (ref, iccid, cb) => { push(brings, iccid); used++; mo2.info.iccid = iccid; cb(null, { action: 'ok' }); } });
+	let r = null;
+	p2.ops.lend_prepare('m2', on, { iccid: B }, (e, x) => { r = x; });
+	eq(r, { ready: true }, 'unused switch: the card was in reach at once');
+	t.now += 130;
+	p2.tick('m2', on); run_for(200);
+	eq(brings, [ B, A ], 'unused switch: no lend opened within 120 s — back to the card it ran on');
+}
+
+// the lend switch's way back, made safe (Codex review)
+{
+	let t = { now: 5000 };
+	let A = '89490200001022832490', B = '89882390001598474352', C = '89882390001598474360';
+	let on = { rsim_lend_switch: '1' };
+	let mk = (ref, bring) => donor_plugin({ t: t, target: fake_client(), donor: sap_donor([]), sim_bring: bring });
+	let prep = (p, ref, iccid) => { let r = null; p.ops.lend_prepare(ref, on, { iccid: iccid }, (e, x) => { r = e ? { err: e } : x; }); run_for(50); return r; };
+
+	// the current card unknown (being read): nothing starts
+	let m3 = modem_obj('m3');
+	m3.info = { iccid: null };
+	let b3 = [];
+	let p3 = mk('m3', (ref, iccid, cb) => { push(b3, iccid); cb(null, { action: 'ok' }); });
+	eq(prep(p3, 'm3', B), { ready: false, step: 'its current card is being read' }, 'safe: no switch while its own card is unknown');
+	eq(b3, [], 'safe: ...nothing moved');
+
+	// abandoned on the way there: back after the lease
+	let m4 = modem_obj('m4');
+	m4.info = { iccid: A };
+	let b4 = [];
+	let p4 = mk('m4', (ref, iccid, cb) => { push(b4, iccid); (iccid == A) ? cb(null, { action: 'ok' }) : cb(null, { action: 'slot', slot: 2 }); });
+	eq(prep(p4, 'm4', B)?.ready, false, 'safe: on the way there');
+	t.now += 35;
+	p4.tick('m4', on); run_for(50);
+	eq(b4, [ B, A ], 'safe: a switch nobody asks about for 30 s goes back');
+
+	// another card while one is ready: busy, until it is back
+	let m5 = modem_obj('m5');
+	m5.info = { iccid: A };
+	let p5 = mk('m5', (ref, iccid, cb) => { m5.info.iccid = iccid; cb(null, { action: 'ok' }); });
+	eq(prep(p5, 'm5', B), { ready: true }, 'safe: card B ready');
+	eq(prep(p5, 'm5', C)?.err?.error, 'busy', 'safe: card C waits — B is not taken away before its lend');
+
+	// the way back refused: kept, tried again later
+	let m6 = modem_obj('m6');
+	m6.info = { iccid: A };
+	let refuse = 1, b6 = [];
+	let p6 = mk('m6', (ref, iccid, cb) => {
+		push(b6, iccid);
+		if (iccid == A && refuse-- > 0) return cb(null, { action: 'refuse', detail: 'inventory not read yet' });
+		m6.info.iccid = iccid; cb(null, { action: 'ok' });
+	});
+	eq(prep(p6, 'm6', B), { ready: true }, 'safe: card B ready on m6');
+	t.now += 130;
+	p6.tick('m6', on); run_for(50);
+	eq([ slice(b6, 1), m6.info.iccid ], [ [ A ], B ], 'safe: the way back refused once — still on B');
+	t.now += 30;
+	p6.tick('m6', on); run_for(50);
+	eq(length(b6), 2, 'safe: ...not hammered before its backoff');
+	t.now += 40;
+	p6.tick('m6', on); run_for(50);
+	eq(m6.info.iccid, A, 'safe: tried again after the backoff, and back on A');
 }
 
 // --- a card lent to another router (wwandctl rsim proxy) -------------------------
